@@ -188,6 +188,19 @@
             android:exported="true"
             android:permission="android.permission.WRITE_SECURE_SETTINGS" />
 
+        <!-- now_playing: named in MediaSessionManager.getActiveSessions, which only answers an allowed notification
+             listener. Disabled here; MainActivity turns it on only while now_playing is on. See NowPlayingListener. -->
+        <service
+            android:name=".NowPlayingListener"
+            android:exported="true"
+            android:enabled="false"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <!-- The remote's Input button (KEYCODE_TV or KEYCODE_TV_INPUT) opens the input switcher, and input_key_keycodes and
          app_keys (config.xml or a theme) bring back other remote buttons; see InputKeyService. -->
         <service

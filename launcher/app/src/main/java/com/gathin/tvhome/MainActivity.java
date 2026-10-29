@@ -4,6 +4,7 @@ import android.animation.ArgbEvaluator;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.Dialog;
+import android.app.PendingIntent;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -29,6 +30,10 @@ import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaMetadata;
+import android.media.session.MediaController;
+import android.media.session.MediaSessionManager;
+import android.media.session.PlaybackState;
 import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
 import android.media.tv.TvInputManager;
@@ -361,6 +366,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (cfg.restoreKeyServices) ServiceRepair.restore(this);
         settingsRevision = settingsRevision();
         applyViewInputsHandler(cfg.handleViewInputs);
+        applyNowPlayingListener(cfg.nowPlaying);
         settingsKeycodes = cfg.settingsKeycodes;
         settingsKeyPanel = cfg.settingsKeyPanel;
         COLUMNS = cfg.columns;
@@ -443,6 +449,21 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         raceHeadline = findViewById(R.id.raceHeadline);
         raceSessions = findViewById(R.id.raceSessions);
         showStats = cfg.showStats;
+        nowPlaying = cfg.nowPlaying;
+        nowPlayingRow = findViewById(R.id.nowPlaying);
+        nowPlayingArt = findViewById(R.id.nowPlayingArt);
+        nowPlayingArt.setClipToOutline(true);
+        nowPlayingTitle = findViewById(R.id.nowPlayingTitle);
+        nowPlayingArtist = findViewById(R.id.nowPlayingArtist);
+        btnMediaPlayPause = findViewById(R.id.btnMediaPlayPause);
+        View.OnClickListener media = this::onNowPlayingClick;
+        nowPlayingArt.setOnClickListener(media);
+        nowPlayingArt.setOnFocusChangeListener((v, focused) -> v.animate()
+                .scaleX(focused ? 1.2f : 1f).scaleY(focused ? 1.2f : 1f)
+                .setDuration(reducedMotion ? Motion.REDUCED_MS : 160).start());
+        btnMediaPlayPause.setOnClickListener(media);
+        findViewById(R.id.btnMediaPrevious).setOnClickListener(media);
+        findViewById(R.id.btnMediaNext).setOnClickListener(media);
         shamsi = cfg.shamsiDate;
         greetingName = cfg.greetingName;
         if (shamsi) {
@@ -854,6 +875,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             pillsShown = true;
         }
         if (showStats) startStats();
+        if (nowPlaying) startNowPlaying();
         sky.update();
         wallpaperPlayer.start();
         handler.postDelayed(minuteTick, MINUTE_MS);
@@ -1031,6 +1053,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         heroArt.animate().cancel();
         handler.removeCallbacks(minuteTick);
         stopStats();
+        stopNowPlaying();
         if (diya != null) diya.stop();
         cancelPendingFocusScroll();
         // Nothing of ours stays on screen over another app; an undecided prompt simply returns next time.
@@ -1896,6 +1919,149 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         glass.animate().cancel();
         if (animations && !reducedMotion) glass.animate().alpha(0f).setDuration(160).start();
         else glass.setAlpha(0f);
+    }
+
+    // ---- optional now playing (config.xml now_playing) --------------------------------------------
+
+    /** config.xml now_playing, overridable by a theme. Off: the line is gone and no session is read. */
+    private boolean nowPlaying;
+    private View nowPlayingRow;
+    private ImageView nowPlayingArt;
+    private TextView nowPlayingTitle, nowPlayingArtist, btnMediaPlayPause;
+    /** The session the row shows, which the buttons control. */
+    private MediaController shownSession;
+    private boolean shownPlaying;
+    /** Set while Home is resumed and the listener has notification access. */
+    private MediaSessionManager mediaSessions;
+    private List<MediaController> sessions = Collections.emptyList();
+    private final MediaSessionManager.OnActiveSessionsChangedListener sessionsChanged = this::followSessions;
+    private final MediaController.Callback sessionChanged = new MediaController.Callback() {
+        @Override
+        public void onPlaybackStateChanged(PlaybackState state) {
+            showNowPlaying();
+        }
+
+        @Override
+        public void onMetadataChanged(MediaMetadata metadata) {
+            showNowPlaying();
+        }
+    };
+
+    /** NowPlayingListener is disabled in the manifest; on only while now_playing is, written only when it differs. */
+    private void applyNowPlayingListener(boolean on) {
+        ComponentName listener = new ComponentName(this, NowPlayingListener.class);
+        PackageManager pm = getPackageManager();
+        int want = on ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED : PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+        if (pm.getComponentEnabledSetting(listener) != want) {
+            pm.setComponentEnabledSetting(listener, want, PackageManager.DONT_KILL_APP);
+        }
+    }
+
+    private void startNowPlaying() {
+        if (mediaSessions != null) return;
+        nowPlayingRow.setVisibility(View.INVISIBLE);
+        MediaSessionManager msm = getSystemService(MediaSessionManager.class);
+        ComponentName listener = new ComponentName(this, NowPlayingListener.class);
+        try {
+            msm.addOnActiveSessionsChangedListener(sessionsChanged, listener, handler);
+            mediaSessions = msm;
+            followSessions(msm.getActiveSessions(listener));
+        } catch (SecurityException e) {
+            // No notification access yet (cmd notification allow_listener, see config.xml): the line stays empty.
+        }
+    }
+
+    private void stopNowPlaying() {
+        if (mediaSessions == null) return;
+        mediaSessions.removeOnActiveSessionsChangedListener(sessionsChanged);
+        mediaSessions = null;
+        // Paused: the last line stays on screen, as with show_stats; onResume reads the sessions again.
+        for (MediaController c : sessions) c.unregisterCallback(sessionChanged);
+        sessions = Collections.emptyList();
+    }
+
+    private void followSessions(List<MediaController> active) {
+        for (MediaController c : sessions) c.unregisterCallback(sessionChanged);
+        sessions = active == null ? Collections.emptyList() : active;
+        for (MediaController c : sessions) c.registerCallback(sessionChanged, handler);
+        showNowPlaying();
+    }
+
+    /** The art opens the playing app's own screen, its session activity (usually the player); the buttons control it. */
+    private void onNowPlayingClick(View v) {
+        if (shownSession == null) return;
+        MediaController.TransportControls controls = shownSession.getTransportControls();
+        int id = v.getId();
+        if (id == R.id.btnMediaPrevious) {
+            controls.skipToPrevious();
+        } else if (id == R.id.btnMediaNext) {
+            controls.skipToNext();
+        } else if (id == R.id.btnMediaPlayPause) {
+            if (shownPlaying) controls.pause();
+            else controls.play();
+        } else {
+            PendingIntent player = shownSession.getSessionActivity();
+            try {
+                if (player != null) player.send();
+            } catch (PendingIntent.CanceledException e) {
+                Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    /** The first playing (or buffering) session, else the first paused one; -1 when none has anything to show. */
+    static int pickSession(int[] states) {
+        int paused = -1;
+        for (int i = 0; i < states.length; i++) {
+            if (states[i] == PlaybackState.STATE_PLAYING || states[i] == PlaybackState.STATE_BUFFERING) return i;
+            if (paused < 0 && states[i] == PlaybackState.STATE_PAUSED) paused = i;
+        }
+        return paused;
+    }
+
+    /** Shows pickSession's session: art (or the app's icon), title, artist; dimmed while paused. */
+    private void showNowPlaying() {
+        int[] states = new int[sessions.size()];
+        for (int i = 0; i < states.length; i++) {
+            PlaybackState st = sessions.get(i).getPlaybackState();
+            MediaMetadata meta = sessions.get(i).getMetadata();
+            boolean titled = meta != null && !TextUtils.isEmpty(meta.getDescription().getTitle());
+            states[i] = st != null && titled ? st.getState() : PlaybackState.STATE_NONE;
+        }
+        int pick = pickSession(states);
+        shownSession = pick < 0 ? null : sessions.get(pick);
+        if (shownSession == null) {
+            // Nothing to control: a focused button would vanish under the D-pad, so focus moves to the top bar.
+            if (nowPlayingRow.hasFocus()) firstTopButton().requestFocus();
+            nowPlayingRow.setVisibility(View.INVISIBLE);
+            nowPlayingArt.setImageDrawable(null);
+            return;
+        }
+        MediaMetadata meta = shownSession.getMetadata();
+        boolean playing = states[pick] != PlaybackState.STATE_PAUSED;
+        shownPlaying = playing;
+        nowPlayingTitle.setText(meta.getDescription().getTitle());
+        nowPlayingArt.setContentDescription(meta.getDescription().getTitle());
+        nowPlayingArtist.setText(meta.getDescription().getSubtitle());
+        Bitmap art = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+        if (art == null) art = meta.getBitmap(MediaMetadata.METADATA_KEY_ART);
+        if (art == null) art = meta.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON);
+        if (art != null) {
+            nowPlayingArt.setImageBitmap(art);
+        } else {
+            try {
+                nowPlayingArt.setImageDrawable(getPackageManager().getApplicationIcon(shownSession.getPackageName()));
+            } catch (PackageManager.NameNotFoundException e) {
+                nowPlayingArt.setImageDrawable(null);
+            }
+        }
+        float alpha = playing ? 1f : 0.55f;
+        nowPlayingArt.setAlpha(alpha);
+        nowPlayingTitle.setAlpha(alpha);
+        nowPlayingArtist.setAlpha(alpha);
+        btnMediaPlayPause.setCompoundDrawablesRelativeWithIntrinsicBounds(
+                playing ? R.drawable.ic_pause : R.drawable.ic_play, 0, 0, 0);
+        nowPlayingRow.setVisibility(View.VISIBLE);
     }
 
     // ---- optional system stats (config.xml show_stats) --------------------------------------------
